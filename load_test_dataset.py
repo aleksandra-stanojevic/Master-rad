@@ -38,7 +38,6 @@ def apply_clahe(image):
     clahe_image = clahe.apply(image)
     return clahe_image
 
-
 for filename in os.listdir(origin_covid19):
     if filename.lower().endswith((".jpg", ".png", ".jpeg")):
         covid19Image = cv2.imread(os.path.join(origin_covid19, filename))
@@ -47,7 +46,7 @@ for filename in os.listdir(origin_covid19):
         # CLAHE VERSION (CONVERT TO GRAYSCALE AND APPLY CLAHE)
         if len(covid19Image.shape) == 3:
             covid19Image = cv2.cvtColor(covid19Image, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(target_covid19+row['filename'], apply_clahe(covid19Image))
+        cv2.imwrite(target_covid19+filename, apply_clahe(covid19Image))
         # cv2.imwrite(os.path.join(target_covid19, filename), covid19Image)
 print("Images for covid19 are loaded successfully")
 
@@ -59,7 +58,7 @@ for filename in os.listdir(origin_pneumonia):
         # CLAHE VERSION (CONVERT TO GRAYSCALE AND APPLY CLAHE)
         if len(pneumoniaImage.shape) == 3:
             pneumoniaImage = cv2.cvtColor(pneumoniaImage, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(target_pneumonia+row['Image Index'], apply_clahe(pneumoniaImage))
+        cv2.imwrite(target_pneumonia+filename, apply_clahe(pneumoniaImage))
         # cv2.imwrite(os.path.join(target_pneumonia, filename), pneumoniaImage)
 print("Images for pneumonia are loaded successfully")
 
@@ -71,6 +70,6 @@ for filename in os.listdir(origin_no_findings):
         # CLAHE VERSION (CONVERT TO GRAYSCALE AND APPLY CLAHE)
         if len(noFindingImage.shape) == 3:
             noFindingImage = cv2.cvtColor(noFindingImage, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(target_no_findings+imagePath, apply_clahe(noFindingImage))
+        cv2.imwrite(target_no_findings+filename, apply_clahe(noFindingImage))
         # cv2.imwrite(os.path.join(target_no_findings, filename), noFindingImage)
 print("Images for no_findings are loaded successfully")
