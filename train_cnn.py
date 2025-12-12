@@ -1,38 +1,73 @@
 import tensorflow as tf
+import keras
 import pathlib
 import numpy as np
 import pandas as pd
 import os.path
 import os
+import time
 import matplotlib.pyplot as plt
+import sys, subprocess, pkgutil
+if not pkgutil.find_loader("seaborn"):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "seaborn"])
+import seaborn as sns
 
 from datetime import datetime
 from sklearn.model_selection import KFold
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 from tensorflow.keras import layers, models
 from tensorflow.keras.layers import RandomRotation, RandomFlip, RandomTranslation, RandomZoom, RandomBrightness
-from tensorflow.keras.layers import Input, AveragePooling2D, GlobalAveragePooling2D, Dropout, Dense, Lambda
+from tensorflow.keras.layers import Input, GlobalAveragePooling2D, Dropout, Dense, Lambda
 from tensorflow.keras.models import Model
-from tensorflow.keras.applications import MobileNetV2, VGG19, VGG16, EfficientNetB0, EfficientNetB1
-from tensorflow.keras.applications import EfficientNetB2, EfficientNetB3, DenseNet121, ResNet50V2
-from tensorflow.keras.optimizers import Adam, AdamW, Nadam, RMSprop, SGD
+from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, CSVLogger, ReduceLROnPlateau
 from tensorflow.keras.losses import CategoricalCrossentropy
 from tensorflow.keras.metrics import CategoricalAccuracy, Precision, Recall
 from tensorflow.keras.regularizers import l2
 
 train_and_val_dir = pathlib.Path("train_and_val_datasets")
-# test_dir = pathlib.Path("test_dataset")
+test_dir = pathlib.Path("test_dataset")
 
 batch_size = 16
 image_height = 224
 image_width = 224
 epochs = 20
-learning_rate = 1e-3
+fine_tune_epochs = 10
+# options are "vgg16", "mobilenetv2" and "efficientnetb0"
+model_name = "efficientnetb0" 
+# options are "undersampling", "oversampling", "weighted_classes", "focal_loss" and "CycleGAN"
+method_name = "oversampling"
 AUTOTUNE = tf.data.AUTOTUNE
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-# ================================
+MODEL_OPTIONS = {
+    "vgg16": {
+        "model": tf.keras.applications.VGG16,
+        "preprocess": tf.keras.applications.vgg16.preprocess_input,
+        "learning_rate": 1e-3,
+        "fine_tuning_learning_rate": 1e-5,
+        # Unfreeze whole block5 and last conv layer of block4
+        "fine_tune_layers": ["block4_conv3", "block5_conv1", "block5_conv2", "block5_conv3"]
+    },
+    "mobilenetv2": {
+        "model": tf.keras.applications.MobileNetV2,
+        "preprocess": tf.keras.applications.mobilenet_v2.preprocess_input,
+        "learning_rate": 2e-3,
+        "fine_tuning_learning_rate": 1e-5,
+        # Unfreeze block16 and block15
+        "fine_tune_layers": ["block_15", "block_16", "Conv_1", "Conv_1_bn", "out_relu"]
+    },
+    "efficientnetb0": {
+        "model": tf.keras.applications.EfficientNetB0,
+        "preprocess": tf.keras.applications.efficientnet.preprocess_input,
+        "learning_rate": 1e-3,
+        "fine_tuning_learning_rate": 5e-5,
+        # Unfreeze block7
+        "fine_tune_layers": ["block7", "top_conv", "top_bn", "top_activation"]
+    }
+}
+
 # Function for creating dataframe out of the directory
-# ================================
 def build_dataframe(directory):
     filepaths = []
     labels = []
@@ -59,14 +94,7 @@ def build_dataframe(directory):
     
     return df, df["label"].unique()
 
-df, classes = build_dataframe(train_and_val_dir)
-print("Number of loaded images: ", len(df))
-print("Classes: ", classes)
-print("Number of loaded images per class: ", df["label"].value_counts())
-
-# ================================
 # Function for loading images
-# ================================
 def load_image(path, label):
     image = tf.io.read_file(path)
 
@@ -82,9 +110,7 @@ def load_image(path, label):
     image = tf.image.resize(image, [image_height, image_width], method="nearest")
     return image, label
 
-# ================================
 # Function for creating dataset from dataframe
-# ================================  
 def df_to_dataset(df, shuffle=True):
     paths = df["filepath"].values
     labels = np.stack(df["label_onehot"].values)
@@ -96,9 +122,6 @@ def df_to_dataset(df, shuffle=True):
     # loading the images to dataset and resizing them
     ds = ds.map(lambda x, y: load_image(x, y), num_parallel_calls=AUTOTUNE)
 
-    # buffered prefetching to load images from disk without having I/O become blocking
-    # When you train a model your GPU/CPU is training the model, and your CPU is loading + preparing the next batch of data
-    # If these two don’t work in parallel, the GPU ends up waiting for data — which slows training down.
     # prefetch() tells TensorFlow to prepare the next batch in the background while the model is training on the current batch
     # tf.data.AUTOTUNE means: TensorFlow, you decide how many batches to prepare ahead of time.
     ds = ds.batch(batch_size).prefetch(AUTOTUNE)
@@ -117,55 +140,37 @@ data_augmentation = tf.keras.Sequential([
     RandomFlip(mode="horizontal")
 ])
 
+# More aggressive version of data augmentation
 # data_augmentation = tf.keras.Sequential([
 #     RandomFlip("horizontal"),
 #     RandomRotation(0.1),
 #     RandomZoom(0.1),
-#     RandomTranslation(height_factor=0.1, width_factor=0.1) # more aggressive
+#     RandomTranslation(height_factor=0.1, width_factor=0.1) 
 # ])
 
-# applying data augmentation on same image 9 times and ploting the outcomes
-# ds = df_to_dataset(df)
-# for image, _ in ds.take(1):
-#   plt.figure(figsize=(10, 10))
-#   first_image = image[0]
-#   for i in range(9):
-#     ax = plt.subplot(3, 3, i + 1)
-#     augmented_image = data_augmentation(tf.expand_dims(first_image, 0))
-#     plt.imshow(augmented_image[0] / 255)
-#     plt.axis('off')
-# plt.show()
-
-# ================================
 # Function for creating the CNN model
-# ================================  
-def build_model(num_classes):   
+def build_model(num_classes, model_name):   
+    if model_name not in MODEL_OPTIONS:
+        raise ValueError(f"❌ Unsupported model: {model_name}")
+
     # data preprocessing
     inputs = Input(shape=(image_height, image_width, 3))
     x = data_augmentation(inputs)
-    preprocess_input = tf.keras.applications.mobilenet_v2.preprocess_input
+    preprocess_input = MODEL_OPTIONS[model_name]["preprocess"]
     # preprocessing becomes an actual Keras layer in the model graph
     x = Lambda(preprocess_input, name="preprocessing_layer")(x)
 
     # pretrained cnn
-    base_model = MobileNetV2(input_tensor=x,
-                            include_top=False,
-                            weights='imagenet')
+    base_model = MODEL_OPTIONS[model_name]["model"](include_top=False, weights="imagenet", input_tensor=x)
     base_model.trainable = False
     # base_model.summary()
 
     # new classifier
     x=base_model.output
-    # x = base_model(inputs, training=False)
-    # x = AveragePooling2D(pool_size=(4, 4))(x)
     x = GlobalAveragePooling2D()(x)
-    # x = Dropout(0.4)(x)
-    # x = Dense(1024, activation='relu',kernel_initializer='he_uniform',kernel_regularizer=l2(0.001), bias_regularizer=l2(0.001))(x)
-    # x = Dense(256, activation="relu", kernel_initializer='he_uniform',kernel_regularizer=l2(1e-4))(x)
-    # x = Dense(256, activation="relu", kernel_initializer='he_uniform')(x)
     x = Dense(128, activation="relu")(x)
     x = Dropout(0.5)(x)
-    outputs = Dense(3, activation='softmax')(x)
+    outputs = Dense(num_classes, activation='softmax')(x)
 
     model = Model(inputs, outputs)
     # model.summary()
@@ -175,17 +180,10 @@ def build_model(num_classes):
         Precision(name='precision'),
         Recall(name='recall')
     ]
-    # optimize = SGD(learning_rate=0.0001, decay=0.9 / 5, momentum=0.9, nesterov=True)
-    # optimizer_conv = optim.SGD(model_resnet.parameters(), lr=0.001, momentum=0.9)
 
-    model.compile(
-                # optimizer=SGD(learning_rate=learning_rate,
-                #                 momentum=0.9),
-                #   optimizer=Adam(learning_rate=learning_rate),
-                  optimizer=Nadam(learning_rate=learning_rate),
-                #   optimizer=AdamW(learning_rate=learning_rate),
-                loss=CategoricalCrossentropy(),
-                metrics=metrics)
+    model.compile(optimizer=Adam(learning_rate=MODEL_OPTIONS[model_name]["learning_rate"]),
+                  loss=CategoricalCrossentropy(),
+                  metrics=metrics)
 
     # initial loss and accuracy
     # loss0, accuracy0 = model.evaluate(validation_dataset)
@@ -194,87 +192,94 @@ def build_model(num_classes):
 
     return model, base_model
 
-# ================================
-# Callbacks
-# ================================  
-checkpointer = ModelCheckpoint(
-    filepath="models/checkpoints/mobilenetv2_best.keras",
-    monitor="val_loss",
-    verbose=1,
-    save_best_only=True)
-
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-csv_logger = CSVLogger(os.path.join('models','logs',f"MobileNetV2_1-training-{timestamp}.log"))
-
-early_stopper = EarlyStopping(
-    monitor="val_loss",
-    patience=10,
-    restore_best_weights=True,
-    verbose=1)
-
-learning_rate_reduction = ReduceLROnPlateau(
-    monitor='val_loss',     # metric to watch
-    factor=0.5,             # reduce LR by half
-    patience=2,             # wait 3 epochs before reducing
-    min_lr=1e-7,            # final lowest allowed LR
-    verbose=1)
-# learning_rate_reduction = ReduceLROnPlateau(monitor='val_accuracy', 
-#                                             patience=2, 
-#                                             verbose=1, 
-#                                             factor=0.5, 
-#                                             min_lr=1e-7)
-# Bozinovic
-# learning_rate_reduction = ReduceLROnPlateau(monitor='val_loss', 
-#                                             mode='min'
-#                                             patience=2, 
-#                                             verbose=1, 
-#                                             factor=0.1)
-# CoronaNidaan
-# learning_rate_reduction = ReduceLROnPlateau(monitor='val_accuracy', 
-#                                             patience=2, 
-#                                             verbose=1, 
-#                                             factor=0.5, 
-#                                             min_lr=0.00001)
-# wang factor  0.7 patience  5
-
-callbacks = [
-    checkpointer,
-    early_stopper,
-    csv_logger,
-    learning_rate_reduction
-]
-
-def save_fold_plots(history, fold):
+# Function for saving the confusion matrix
+def save_confusion_matrix(y_true, y_pred, class_names, fold):
+    # Make sure directory exists
     out_dir = "acc+loss"
     os.makedirs(out_dir, exist_ok=True)
 
-    # ------- Accuracy plot -------
-    plt.figure()
-    plt.plot(history.history["accuracy"], label="train_acc")
-    plt.plot(history.history["val_accuracy"], label="val_acc")
-    plt.title(f"Fold {fold} Accuracy")
-    plt.xlabel("Epoch")
+    cm = confusion_matrix(y_true, y_pred)
+
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names,
+                yticklabels=class_names)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title(f"Confusion Matrix - Fold {fold}")
+    
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/confusion_matrix_fold_{fold}.png")
+    plt.close()
+
+# Function for saving the acc and loss plots
+def save_plots(history_shallow, history_fine, name):
+    # Make sure directory exists
+    out_dir = "acc+loss"
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Extract metrics
+    acc_shallow = history_shallow.history['accuracy']
+    val_acc_shallow = history_shallow.history['val_accuracy']
+    loss_shallow= history_shallow.history['loss']
+    val_loss_shallow = history_shallow.history['val_loss']
+
+    acc_fine = history_fine.history['accuracy']
+    val_acc_fine = history_fine.history['val_accuracy']
+    loss_fine = history_fine.history['loss']
+    val_loss_fine = history_fine.history['val_loss']
+
+    # Combine
+    acc = acc_shallow + acc_fine
+    val_acc = val_acc_shallow + val_acc_fine
+    loss = loss_shallow + loss_fine
+    val_loss = val_loss_shallow + val_loss_fine
+
+    # Index where fine-tuning starts
+    start_ft = len(acc_shallow) - 1  # use minus 1 because epochs start at 0
+
+
+    ### ---- Plot Accuracy ---- ###
+    plt.figure(figsize=(10, 6))
+    plt.plot(acc, label='Train Accuracy', marker='o')
+    plt.plot(val_acc, label='Val Accuracy', marker='o')
+
+    # Add vertical line
+    plt.axvline(start_ft, linestyle='--', color='red', label='Fine-tuning Start')
+
+    plt.title(f"Accuracy - {name}")
+    plt.xlabel("Epochs")
     plt.ylabel("Accuracy")
     plt.legend()
-    plt.savefig(f"{out_dir}/accuracy_fold_{fold}.png")
+    plt.grid(True)
+    plt.savefig(f"{out_dir}/accuracy_{name}.png", dpi=210)
     plt.close()
 
-    # ------- Loss plot -------
-    plt.figure()
-    plt.plot(history.history["loss"], label="train_loss")
-    plt.plot(history.history["val_loss"], label="val_loss")
-    plt.title(f"Fold {fold} Loss")
-    plt.xlabel("Epoch")
+    ### ---- Plot Loss ---- ###
+    plt.figure(figsize=(10, 6))
+    plt.plot(loss, label='Train Loss', marker='o')
+    plt.plot(val_loss, label='Val Loss', marker='o')
+
+    plt.axvline(start_ft, linestyle='--', color='red', label='Fine-tuning Start')
+
+    plt.title(f"Loss - {name}")
+    plt.xlabel("Epochs")
     plt.ylabel("Loss")
     plt.legend()
-    plt.savefig(f"{out_dir}/loss_fold_{fold}.png")
+    plt.grid(True)
+    plt.savefig(f"{out_dir}/loss_{name}.png", dpi=210)
     plt.close()
 
-def run_5fold_cross_validation(df, class_names):
+def run_5fold_cross_validation(df, class_names, model_name):
+    if model_name not in MODEL_OPTIONS:
+        raise ValueError(f"❌ Unsupported model: {model_name}")
+    
     kf = KFold(n_splits=5, shuffle=True, random_state=123)
     val_accuracy_list = []
     recall_list = []
     precision_list = []
+    f1_score_list = []
+    f1_across_folds = []
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(df)):
         print(f"\n==================== FOLD {fold} ====================\n")
@@ -288,58 +293,87 @@ def run_5fold_cross_validation(df, class_names):
         print("Train samples:", len(train_idx))
         print("Val samples:", len(val_idx))
 
-        model, base_model = build_model(num_classes=len(class_names))
+        # Shallow tunning -------------------------------------------------------------------------------
 
-        history = model.fit(train_ds,
-                            epochs=epochs,
-                            validation_data=val_ds,
-                            callbacks=callbacks)
+        model, base_model = build_model(num_classes=len(class_names), model_name=model_name)
+
+        shallowTunningCallbacks = [
+            # ModelCheckpoint(filepath=f"models/checkpoints/fold_{fold}_{model_name}_shallow_tunning_best.keras",
+            #     monitor="val_loss", verbose=1, save_best_only=True),
+            # CSVLogger(os.path.join('models','logs',f"{model_name}_shallow_tunning_fold_{fold}-{timestamp}.log")),
+            EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-7, verbose=1)
+        ]
+
+        history_shallow = model.fit(train_ds, epochs=epochs, validation_data=val_ds,
+                            callbacks=shallowTunningCallbacks)
+
+        # Fine tunning ----------------------------------------------------------------------------------
+        for layer in base_model.layers:
+            # Unfreeze base_model layers for fine tunning
+            if layer.name in MODEL_OPTIONS[model_name]["fine_tune_layers"]:
+                layer.trainable = True
+            else:
+                layer.trainable = False
+
+            # Keep BatchNormalization layers frozen
+            if isinstance(layer, tf.keras.layers.BatchNormalization):
+                layer.trainable = False
         
-        # # Fine-tune from this layer onwards, so 20 layers are fine tuned
-        # for layer in base_model.layers[-5:]:
-        #     layer.trainable = True
+        metrics = [
+            CategoricalAccuracy(name='accuracy'),
+            Recall(name='recall'),
+            Precision(name='precision')
+        ]
 
-        # for layer in base_model.layers:
-        #     if isinstance(layer, tf.keras.layers.BatchNormalization):
-        #         layer.trainable = False
+        model.compile(
+            optimizer=Adam(learning_rate=MODEL_OPTIONS[model_name]["fine_tuning_learning_rate"]),
+            loss=CategoricalCrossentropy(),
+            metrics=metrics)
+        
+        fineTunningCallbacks = [
+            # ModelCheckpoint(filepath=f"models/checkpoints/fold_{fold}_{model_name}_fine_tunning_best.keras",
+            #     monitor="val_loss", verbose=1, save_best_only=True),
+            # CSVLogger(os.path.join('models','logs',f"{model_name}_fine_tunning_fold_{fold}-{timestamp}.log"))
+            EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=5e-6, verbose=1)
+        ]
 
-        # fine_tuning_learning_rate = 5e-5
-        # model.compile(loss=CategoricalCrossentropy(),
-        #             #   optimizer = Adam(learning_rate=fine_tuning_learning_rate),
-        #             #   optimizer=AdamW(learning_rate=learning_rate),
-        #             #   optimizer = Nadam(learning_rate=fine_tuning_learning_rate),
-        #                 optimizer=SGD(learning_rate=fine_tuning_learning_rate,
-        #                             momentum=0.9),
-        #             metrics=[CategoricalAccuracy(name='accuracy')])
+        history_fine = model.fit(train_ds, epochs=fine_tune_epochs, validation_data=val_ds,
+                            callbacks=fineTunningCallbacks)
+        
+        # Get true labels and predictions
+        y_true = np.concatenate([y for x, y in val_ds], axis=0)
+        y_true = np.argmax(y_true, axis=1)
 
-        # fine_tune_epochs = 10
-        # total_epochs =  epochs + fine_tune_epochs
+        y_pred = model.predict(val_ds)
+        y_pred = np.argmax(y_pred, axis=1)
 
-        # history_fine = model.fit(train_ds,
-        #                         epochs=total_epochs,
-        #                         initial_epoch=len(history.epoch),
-        #                         validation_data=val_ds)
+        # Per-class F1 score
+        f1_per_class = f1_score(y_true, y_pred, average=None)
+        print(f"Class Names: {class_names}")
+        print(f"F1 per class: {f1_per_class}")
 
-        print(f"✔ Finished Fold {fold+1}\n")
+        # Macro-F1 (average of classes)
+        f1_macro = f1_score(y_true, y_pred, average="macro")
+        print(f"F1 Macro: {f1_macro}")
+        
+        # Save training plots and confusion matrix for this fold
+        save_plots(history_shallow, history_fine, f"fold_{fold}")
+        save_confusion_matrix(y_true, y_pred, class_names, fold)
+   
+        loss, acc, rec, prec = model.evaluate(val_ds, verbose=0)
+        val_accuracy_list.append(acc)
+        recall_list.append(rec)
+        precision_list.append(prec)
+        f1_score_list.append(f1_macro)
+        f1_across_folds.append(f1_per_class)
 
-        fold_val_acc = history.history["val_accuracy"][-1]
-        val_accuracy_list.append(fold_val_acc)
-
-        fold_recall = history.history["recall"][-1]
-        recall_list.append(fold_recall)
-
-        fold_precision = history.history["precision"][-1]
-        precision_list.append(fold_precision)
-
-        print(f"FINAL VAL ACCURACY = {fold_val_acc:.4f}")
-        print(f"FINAL RECALL = {fold_recall:.4f}")
-        print(f"FINAL PRECISION = {fold_precision:.4f}")
-
-        # save acc and loss plots
-        save_fold_plots(history, fold)
     
-    print("\n================== CROSS-VAL RESULTS ==================\n")
-
+    #  Print cross-validation metrics
+    print("Validation metrics for: ", model_name.upper(), "-", method_name,
+          " learning_rate=", MODEL_OPTIONS[model_name]["learning_rate"],
+          " fine_tuning_learning_rate=", MODEL_OPTIONS[model_name]["fine_tuning_learning_rate"])
     print("Fold accuracies:", val_accuracy_list)
     print("Mean accuracy:", np.mean(val_accuracy_list))
     print("Std deviation:", np.std(val_accuracy_list))
@@ -352,100 +386,203 @@ def run_5fold_cross_validation(df, class_names):
     print("Mean precision:", np.mean(precision_list))
     print("Std deviation:", np.std(precision_list))
 
-run_5fold_cross_validation(df=df, class_names=classes)
+    f1_across_folds = np.array(f1_across_folds)
+    mean_f1_per_class = np.mean(f1_across_folds, axis=0)
+    print("Mean F1 per class across all folds:", mean_f1_per_class)
 
-# df = df.sample(frac=1, random_state=123).reset_index(drop=True)
-# split_index = int(len(df) * 0.8)
-# train_df = df.iloc[:split_index]
-# val_df   = df.iloc[split_index:]
-# print("Train images:", len(train_df))
-# print("Validation images:", len(val_df))
+    print("Mean F1 Macro:", np.mean(f1_score_list))
+    print("Std F1 Macro:", np.std(f1_score_list))
 
-# train_dataset = df_to_dataset(train_df, shuffle=True)
-# validation_dataset   = df_to_dataset(val_df, shuffle=False)
+def undersampling(df, label_col="label", target_size=200):
+    df_list = []
 
-# model, base_model = build_model(len(classes))
+    for cls, group in df.groupby(label_col):
+        if len(group) > target_size:
+            df_list.append(group.sample(target_size, random_state=42))
+        else:
+            df_list.append(group)  # keep original size (196 for covid)
+    
+    df_bal = pd.concat(df_list).sample(frac=1, random_state=42).reset_index(drop=True)
+    return df_bal
 
-# history = model.fit(train_dataset,
-#                     epochs=epochs,
-#                     validation_data=validation_dataset,
-#                     callbacks=callbacks)
+def oversampling(df, label_col="label", target_size=580):
+    df_list = []
 
-# acc = history.history['accuracy']
-# val_acc = history.history['val_accuracy']
+    for cls, group in df.groupby(label_col):
+        if len(group) < target_size:
+            # oversample with replacement
+            df_list.append(group.sample(target_size, replace=True, random_state=42))
+        else:
+            df_list.append(group)
+    
+    df_balanced = pd.concat(df_list).reset_index(drop=True)
+    return df_balanced
 
-# loss = history.history['loss']
-# val_loss = history.history['val_loss']
 
-# plt.figure(figsize=(8, 8))
-# plt.subplot(2, 1, 1)
-# plt.plot(acc, label='Training Accuracy')
-# plt.plot(val_acc, label='Validation Accuracy')
-# plt.legend(loc='lower right')
-# plt.ylabel('Accuracy')
-# plt.ylim([min(plt.ylim()),1])
-# plt.title('Training and Validation Accuracy')
+df_unbalanced, classes = build_dataframe(train_and_val_dir)
+print("Original dataset:")
+print("Number of loaded images: ", len(df_unbalanced))
+print("Classes: ", classes)
+print("Number of loaded images per class: ", df_unbalanced["label"].value_counts())
 
-# plt.subplot(2, 1, 2)
-# plt.plot(loss, label='Training Loss')
-# plt.plot(val_loss, label='Validation Loss')
-# plt.legend(loc='upper right')
-# plt.ylabel('Cross Entropy')
-# plt.ylim([0,1.0])
-# plt.title('Training and Validation Loss')
-# plt.xlabel('epoch')
-# plt.show()
+# df_balanced = undersampling(df_unbalanced)
+df_balanced = oversampling(df_unbalanced)
+print("Balanced dataset:")
+print("Number of loaded images: ", len(df_balanced))
+print("Classes: ", classes)
+print("Number of loaded images per class: ", df_balanced["label"].value_counts())
 
-# # Fine-tune from this layer onwards, so 20 layers are fine tuned
-# for layer in base_model.layers[-5:]:
-#     layer.trainable = True
+run_5fold_cross_validation(df=df_balanced, class_names=classes, model_name=model_name)
 
-# for layer in base_model.layers:
-#     if isinstance(layer, tf.keras.layers.BatchNormalization):
-#         layer.trainable = False
+def evaluate_test_set(model, test_ds, class_names, folder="acc+loss"):
+    import os
+    os.makedirs(folder, exist_ok=True)
 
-# fine_tuning_learning_rate = 5e-5
-# model.compile(loss=CategoricalCrossentropy(),
-#             #   optimizer = Adam(learning_rate=fine_tuning_learning_rate),
-#             #   optimizer=AdamW(learning_rate=learning_rate),
-#             #   optimizer = Nadam(learning_rate=fine_tuning_learning_rate),
-#                 optimizer=SGD(learning_rate=fine_tuning_learning_rate,
-#                             momentum=0.9),
-#               metrics=[CategoricalAccuracy(name='accuracy')])
+    # === TRUE LABELS ===
+    y_true = np.concatenate([y for x, y in test_ds], axis=0)
+    y_true = np.argmax(y_true, axis=1)
 
-# fine_tune_epochs = 10
-# total_epochs =  epochs + fine_tune_epochs
+    # === PREDICTIONS ===
+    y_pred = np.argmax(model.predict(test_ds), axis=1)
 
-# history_fine = model.fit(train_dataset,
-#                          epochs=total_epochs,
-#                          initial_epoch=len(history.epoch),
-#                          validation_data=validation_dataset)
+    # === CONFUSION MATRIX ===
+    cm = confusion_matrix(y_true, y_pred)
 
-# acc += history_fine.history['accuracy']
-# val_acc += history_fine.history['val_accuracy']
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title("Confusion Matrix (Test Set)")
 
-# loss += history_fine.history['loss']
-# val_loss += history_fine.history['val_loss']
+    plt.tight_layout()
+    plt.savefig(f"{folder}/test_confusion_matrix.png")
+    plt.close()
 
-# plt.figure(figsize=(8, 8))
-# plt.subplot(2, 1, 1)
-# plt.plot(acc, label='Training Accuracy')
-# plt.plot(val_acc, label='Validation Accuracy')
-# plt.ylim([0.4, 1])
-# plt.plot([epochs-1,epochs-1],
-#           plt.ylim(), label='Start Fine Tuning')
-# plt.legend(loc='lower right')
-# plt.title('Training and Validation Accuracy')
+    # === METRICS ===
+    accuracy = accuracy_score(y_true, y_pred)
+    f1_per_class = f1_score(y_true, y_pred, average=None)
+    f1_macro = f1_score(y_true, y_pred, average="macro")
+    precision = precision_score(y_true, y_pred, average=None)
+    recall = recall_score(y_true, y_pred, average=None)
 
-# plt.subplot(2, 1, 2)
-# plt.plot(loss, label='Training Loss')
-# plt.plot(val_loss, label='Validation Loss')
-# plt.ylim([0, 1.0])
-# plt.plot([epochs-1,epochs-1],
-#          plt.ylim(), label='Start Fine Tuning')
-# plt.legend(loc='upper right')
-# plt.title('Training and Validation Loss')
-# plt.xlabel('epoch')
+    return accuracy, f1_per_class, f1_macro, precision, recall
 
-# plt.savefig("plot.png")
-# plt.show()
+# FINAL MODEL ---------------------------------------------------------------------------
+# Create datasets allocating 80% for training and 20% for validation
+df_final = df_balanced.sample(frac=1, random_state=123).reset_index(drop=True)
+split_index = int(len(df_final) * 0.8)
+train_df = df_final.iloc[:split_index]
+val_df   = df_final.iloc[split_index:]
+print("Train images:", len(train_df))
+print("Validation images:", len(val_df))
+
+train_dataset = df_to_dataset(train_df, shuffle=True)
+validation_dataset   = df_to_dataset(val_df, shuffle=False)
+
+start_time = time.time()
+model, base_model = build_model(num_classes=len(classes), model_name=model_name)
+
+shallowTunningCallbacks = [
+    # ModelCheckpoint(filepath=f"models/checkpoints/final_{model_name}_shallow_tunning_best.keras",
+    #     monitor="val_loss", verbose=1, save_best_only=True),
+    # CSVLogger(os.path.join('models','logs',f"{model_name}_shallow_tunning_final-{timestamp}.log")),
+    EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-7, verbose=1)
+]
+
+shallow_history = model.fit(train_dataset,
+                    epochs=epochs,
+                    validation_data=validation_dataset,
+                    callbacks=shallowTunningCallbacks)
+
+# Fine tunning
+for layer in base_model.layers:
+    # Unfreeze base_model layers for fine tunning
+    if layer.name in MODEL_OPTIONS[model_name]["fine_tune_layers"]:
+        layer.trainable = True
+    else:
+        layer.trainable = False
+
+    # Keep BatchNormalization layers frozen
+    if isinstance(layer, tf.keras.layers.BatchNormalization):
+        layer.trainable = False
+
+metrics = [
+    CategoricalAccuracy(name='accuracy'),
+    Recall(name='recall'),
+    Precision(name='precision')
+]
+
+model.compile(
+    optimizer=Adam(learning_rate=MODEL_OPTIONS[model_name]["fine_tuning_learning_rate"]),
+    loss=CategoricalCrossentropy(),
+    metrics=metrics)
+
+fineTunningCallbacks = [
+    ModelCheckpoint(filepath=f"models/final_checkpoints/final_{model_name}_{method_name}_fine_tunning_best.keras",
+        monitor="val_loss", verbose=1, save_best_only=True),
+    CSVLogger(os.path.join('models','logs',f"{model_name}_{method_name}_fine_tunning_final-{timestamp}.log")),
+    EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True, verbose=1),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=5e-6, verbose=1)
+]
+
+history = model.fit(train_dataset, epochs=fine_tune_epochs, validation_data=validation_dataset,
+                    callbacks=fineTunningCallbacks)
+
+end_time = time.time()
+
+training_time = end_time - start_time
+print(f"\nTotal final model training time: {training_time/60:.2f} minutes")
+
+# Get true labels and predictions
+y_true = np.concatenate([y for x, y in validation_dataset], axis=0)
+y_true = np.argmax(y_true, axis=1)
+
+y_pred = model.predict(validation_dataset)
+y_pred = np.argmax(y_pred, axis=1)
+
+# Per-class F1 score
+f1_per_class = f1_score(y_true, y_pred, average=None)
+print(f"Class Names: {classes}")
+print(f"F1 per class: {f1_per_class}")
+
+# Macro-F1 (average of classes)
+f1_macro = f1_score(y_true, y_pred, average="macro")
+print(f"F1 Macro: {f1_macro}")
+
+# Save training plots and confusion matrix for final model
+save_plots(shallow_history, history, "final")
+
+print("Validation metrics for final: ", model_name.upper(), "-", method_name,
+        " learning_rate=", MODEL_OPTIONS[model_name]["learning_rate"],
+        " fine_tuning_learning_rate=", MODEL_OPTIONS[model_name]["fine_tuning_learning_rate"])
+
+loss, acc, rec, prec = model.evaluate(validation_dataset, verbose=0)
+print("Validation accuracy:", acc)
+print("Validation recall:", rec)
+print("Validation precision:", prec)
+print("Validation F1 macro:", f1_macro)
+
+# FINAL MODEL TESTING---------------------------------------------------------------------------
+test_df, classes = build_dataframe(test_dir)
+print("Number of loaded images: ", len(test_df))
+print("Classes: ", classes)
+print("Number of loaded images per class: ", test_df["label"].value_counts())
+
+test_ds = df_to_dataset(test_df, shuffle=False)
+# model.evaluate(test_ds)
+
+acc, f1, f1_macro, prec, rec = evaluate_test_set(model, test_ds, classes)
+
+print("\n===== FINAL TEST RESULTS =====")
+print("Accuracy:", acc)
+print("Classes:", classes)
+print("F1 per class:", f1)
+print("Macro F1:", f1_macro)
+print("Precision:", prec)
+print("Mean precision:", np.mean(prec))
+print("Std deviation:", np.std(prec))
+print("Recall:", rec)
+print("Mean recall:", np.mean(rec))
+print("Std deviation:", np.std(rec))
