@@ -535,6 +535,7 @@ print("Number of loaded images per class: ", df_unbalanced["label"].value_counts
 
 # function run_5fold_cross_validation call when applying CycleGAN approach
 # run_5fold_cross_validation(df=df_unbalanced, class_names=classes, model_name=model_name, df_gan=df_gan)
+
 run_5fold_cross_validation(df=df_unbalanced, class_names=classes, model_name=model_name)
 
 # function for calculating test metric and printing confusion matrix
