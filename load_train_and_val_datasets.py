@@ -16,20 +16,15 @@ lung_model = YOLO("YOLO/lung_yolo_runs/lung_detector/weights/best.pt")
 
 def crop_lungs_with_yolo(model, img):
     results = model(img)[0]
-
     if len(results.boxes) == 0:
         # No lungs detected → return original image
         return img
-
     boxes = results.boxes.xyxy.cpu().numpy()
-    
     # Take the largest box (the lungs)
     areas = (boxes[:,2] - boxes[:,0]) * (boxes[:,3] - boxes[:,1])
     box = boxes[areas.argmax()]
-
     x1, y1, x2, y2 = map(int, box)
     cropped = img[y1:y2, x1:x2]
-
     return cropped
 
 # Function to apply CLAHE to an image
