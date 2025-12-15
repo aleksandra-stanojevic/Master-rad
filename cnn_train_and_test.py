@@ -332,7 +332,7 @@ def run_5fold_cross_validation(df, class_names, model_name):
 
         # Shallow tunning -------------------------------------------------------------------------------
 
-        # fical loss approach
+        # focal loss approach
         # focal_loss = categorical_focal_loss(alpha=alpha, gamma=2.0)
         # model, base_model = build_model(num_classes=len(class_names), model_name=model_name, loss=focal_loss)
 
